@@ -38,7 +38,7 @@ from frappe.model.base_document import (
 	BaseDocument,
 )
 from frappe.model.document import Document
-from frappe.model.utils import is_single_doctype
+from frappe.model.utils import is_single_doctype, is_virtual_doctype
 from frappe.model.workflow import get_workflow_name
 from frappe.modules import load_doctype_module
 from frappe.utils import cached_property, cast, cint, cstr
@@ -462,16 +462,67 @@ class Meta(Document):
 						break
 
 	def add_custom_links_and_actions(self):
+		# A cached positive keeps the ordinary query path. Recheck negatives
+		# against a fresh column census before avoiding an absent-table probe.
+		try:
+			cached_tables = frappe.client_cache.get_value("db_tables")
+		except Exception:
+			cached_tables = None
+		if type(cached_tables) not in (list, tuple) or not cached_tables or not all(
+			type(table) is str and table for table in cached_tables
+		):
+			cached_tables = None
+		inventory_read = False
+		tables = None
 		for doctype, fieldname in (
 			("DocType Link", "links"),
 			("DocType Action", "actions"),
 			("DocType State", "states"),
 		):
-			# ignore_ddl because the `custom` column was added later via a patch
-			for d in frappe.get_all(
-				doctype, fields="*", filters=dict(parent=self.name, custom=1), ignore_ddl=True
+			read_custom_rows = True
+			if (
+				cached_tables is not None
+				and f"tab{doctype}" not in cached_tables
+				and not is_virtual_doctype(doctype)
 			):
-				self.append(fieldname, d)
+				# A warm column cache can still make the original query run
+				# after a table was dropped or renamed; preserve that path.
+				try:
+					cached_columns = frappe.client_cache.get_value(f"table_columns::tab{doctype}")
+				except Exception:
+					cached_columns = False
+				if cached_columns is None:
+					if not inventory_read:
+						inventory_read = True
+						try:
+							# Match get_db_table_columns: table name across all visible
+							# schemas, rather than only the current database's tables.
+							information_schema = frappe.qb.Schema("information_schema")
+							tables = (
+								frappe.qb.from_(information_schema.columns)
+								.select(information_schema.columns.table_name)
+								.where(information_schema.columns.table_name.isin(
+									("tabDocType Link", "tabDocType Action", "tabDocType State")
+								))
+								.distinct()
+								.run(pluck=True)
+							)
+						except Exception:
+							tables = None
+						if type(tables) not in (list, tuple) or not all(
+							type(table) is str and table in (
+								"tabDocType Link", "tabDocType Action", "tabDocType State"
+							) for table in tables
+						):
+							tables = None
+					read_custom_rows = tables is None or f"tab{doctype}" in tables
+
+			# ignore_ddl because the `custom` column was added later via a patch
+			if read_custom_rows:
+				for d in frappe.get_all(
+					doctype, fields="*", filters=dict(parent=self.name, custom=1), ignore_ddl=True
+				):
+					self.append(fieldname, d)
 
 			# set the fields in order if specified
 			# order is saved as `links_order`
